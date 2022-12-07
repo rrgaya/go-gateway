@@ -1,0 +1,24 @@
+{
+    // Config to test integration bot
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug: Test Integration",
+            "type": "go",
+            "request": "launch",
+            "mode": "debug",
+            "program": "${workspaceFolder}/cmd/test_integration/main.go",
+            "env": {},
+            "args": [
+                "--exchange=WhiteBIT",
+                "--symbol=LTC/USDT",
+                "--price=0.000000000000001",
+                "--amount=0.0000001",
+                "--sell",
+                "--apiKey=1cf6b9bd6e08adb2f1761508048abc44",
+                "--apiSecret=b479df27f7dc0eb1b906e897c5ced856"
+            ],
+            "showLog": true
+        },
+    ]
+}

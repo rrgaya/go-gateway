@@ -1,0 +1,286 @@
+package hotbit
+
+import (
+	"bytes"
+	"compress/gzip"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/herenow/atomic-gtw/gateway"
+	"golang.org/x/net/proxy"
+)
+
+var HotbitWsUrl = "wss://ws.hotbit.io/"
+
+type WsSession struct {
+	options       gateway.Options
+	conn          *websocket.Conn
+	message       chan WsMessage
+	onDisconnect  chan error
+	requests      map[int64]chan WsMessage
+	requestId     int64
+	requestIdLock *sync.Mutex
+	receivedRead  chan bool
+	quit          chan bool
+	socksURL      *url.URL
+}
+
+func NewWsSession(options gateway.Options, onDisconnect chan error) *WsSession {
+	return &WsSession{
+		options:       options,
+		message:       make(chan WsMessage),
+		requests:      make(map[int64]chan WsMessage),
+		quit:          make(chan bool),
+		receivedRead:  make(chan bool),
+		onDisconnect:  onDisconnect,
+		requestId:     100,
+		requestIdLock: &sync.Mutex{},
+	}
+}
+
+func (w *WsSession) SetProxy(uri *url.URL) {
+	w.socksURL = uri
+	return
+}
+
+type WsMessage struct {
+	Method string          `json:"method"`
+	Error  string          `json:"error"`
+	Id     int64           `json:"id"`
+	Params json.RawMessage `json:"params"`
+	Result json.RawMessage `json:"result"`
+}
+
+func NewWsRequest(method string, params interface{}) WsRequest {
+	return WsRequest{
+		Method: method,
+		Params: params,
+	}
+}
+
+type WsRequest struct {
+	Method string      `json:"method"`
+	Params interface{} `json:"params"`
+	Id     int64       `json:"id"`
+}
+
+func (w *WsSession) Message() chan WsMessage {
+	return w.message
+}
+
+func (w *WsSession) Connect() error {
+	dialer := websocket.Dialer{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+
+	if w.socksURL != nil {
+		proxyDialer, err := proxy.FromURL(w.socksURL, proxy.Direct)
+		if err != nil {
+			return fmt.Errorf("Hotbit proxy from uri %s failed, err: %s", w.socksURL, err)
+		}
+
+		dialer.NetDial = proxyDialer.Dial
+	}
+
+	headers := http.Header{}
+	headers.Add("User-Agent", w.options.UserAgent)
+	headers.Add("Cookie", w.options.Cookie)
+	headers.Add("Origin", "https://www.hotbit.io")
+
+	ws, resp, err := dialer.Dial(HotbitWsUrl, headers)
+	if err != nil {
+		return fmt.Errorf("err: %s, resp status code: %s", err, resp.Status)
+	}
+
+	w.conn = ws
+
+	go w.websocketPinger()
+	go w.idleConnectionChecker()
+	go w.messageHandler()
+
+	return nil
+}
+
+func (w *WsSession) Close() {
+	close(w.quit)
+	w.conn.Close()
+}
+
+func (w *WsSession) messageHandler() {
+	for {
+		_, zMessage, err := w.conn.ReadMessage()
+		if err != nil {
+			if w.onDisconnect != nil {
+				w.onDisconnect <- err
+				return
+			}
+			panic(fmt.Errorf("read msg err: %s", err))
+		}
+
+		w.receivedRead <- true
+
+		msgReader := bytes.NewReader(zMessage)
+		reader, err := gzip.NewReader(msgReader)
+		if err != nil {
+			log.Printf("Failed to initialize gzip reader, err %s", err)
+			continue
+		}
+
+		message, err := ioutil.ReadAll(reader)
+		if err != nil {
+			log.Printf("Failed to read gzip, err %s", err)
+			continue
+		}
+
+		wsMessage := WsMessage{}
+		err = json.Unmarshal(message, &wsMessage)
+		if err != nil {
+			log.Println("Hotbit websocket unmarhsal error", err)
+			continue
+		}
+
+		// Check for request callbacks
+		if wsMessage.Id > 0 {
+			resCh, ok := w.requests[wsMessage.Id]
+			if ok {
+				delete(w.requests, wsMessage.Id)
+				resCh <- wsMessage
+			}
+		}
+
+		w.message <- wsMessage
+	}
+}
+
+func (w *WsSession) idleConnectionChecker() {
+	timeout := 15 * time.Second
+	for {
+		select {
+		case _ = <-w.receivedRead:
+		case <-time.After(timeout):
+			err := fmt.Errorf("Hotbit stale connection, haven't received any pong or message in %v", timeout)
+			if w.options.Verbose {
+				log.Printf("%s", err)
+			}
+			w.Close()
+			w.onDisconnect <- err
+			return
+		}
+	}
+}
+
+func (w *WsSession) websocketPinger() {
+	for {
+		select {
+		case <-time.After(5 * time.Second):
+			err := w.sendPing()
+			if err != nil {
+				err = fmt.Errorf("Hotbit ws failed to send ping request, err: %s", err)
+				if w.options.Verbose {
+					log.Printf("%s", err)
+				}
+			}
+		case <-w.quit:
+			return
+		}
+	}
+}
+
+func (w *WsSession) SendRequest(message *WsRequest) (WsMessage, error) {
+	return w.SendRequestWithTimeout(message, 5*time.Second)
+}
+
+func (w *WsSession) SendRequestWithTimeout(message *WsRequest, timeout time.Duration) (WsMessage, error) {
+	resCh, err := w.SendRequestAsync(message)
+	if err != nil {
+		return WsMessage{}, err
+	}
+
+	select {
+	case res := <-resCh:
+		return res, nil
+	case <-time.After(timeout):
+		return WsMessage{}, errors.New(fmt.Sprintf("Request id %d timed out, didn't receive a response within %d seconds", message.Id, timeout/time.Second))
+	}
+}
+
+func (w *WsSession) SendRequestAsync(message *WsRequest) (chan WsMessage, error) {
+	msgChan := make(chan WsMessage)
+
+	w.requestIdLock.Lock()
+	w.requestId++
+	message.Id = w.requestId
+	w.requestIdLock.Unlock()
+
+	// Register callback
+	w.requests[message.Id] = msgChan
+
+	err := w.SendMessage(message)
+	if err != nil {
+		delete(w.requests, message.Id) // Deregister
+		close(msgChan)
+		return nil, err
+	}
+
+	return msgChan, nil
+}
+
+func (w *WsSession) SendMessage(message *WsRequest) error {
+	data, err := json.Marshal(message)
+	if err != nil {
+		return err
+	}
+
+	return w.conn.WriteMessage(websocket.TextMessage, data)
+}
+
+func (w *WsSession) sendPing() error {
+	pingReq := WsRequest{
+		Method: "server.ping",
+		Params: [0]int64{},
+	}
+
+	res, err := w.SendRequest(&pingReq)
+	if err != nil {
+		return err
+	}
+
+	if !strings.Contains(string(res.Result), "pong") {
+		return errors.New(fmt.Sprintf("Ping request response failed, please inspect, response: %s", string(res.Result)))
+	}
+
+	return nil
+}
+
+func (w *WsSession) Authenticate(userSign UserSign) error {
+	authReq := WsRequest{
+		Method: "server.auth2",
+		Params: []interface{}{
+			userSign.UID,
+			userSign.Time,
+			userSign.From,
+			userSign.Sign,
+		},
+	}
+
+	res, err := w.SendRequest(&authReq)
+	if err != nil {
+		panic(fmt.Errorf("failed to send auth", err))
+	}
+
+	if !strings.Contains(string(res.Result), "success") {
+		return errors.New(fmt.Sprintf("Auth failure response, please inspect, response: %s", string(res.Result)))
+	}
+
+	return nil
+}
